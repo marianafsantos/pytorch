@@ -5611,6 +5611,16 @@ class KernelGroup:
         return code.getvalue()
 
     def call_kernel(self, wrapper, kernel_name):
+        # Peak-memory reordering can expose kernel-group outputs that are live
+        # across kernels without keeping them as scheduler node outputs.
+        # Materialize every live, non-inplace output before the call so the
+        # generated wrapper never passes an unallocated buffer.
+        for name in self.args.live_output_buffers():
+            if name in self.args.inplace_buffers:
+                continue
+            buf = V.graph.try_get_buffer(name)
+            if isinstance(buf, ir.Buffer):
+                V.graph.wrapper_code.codegen_allocation(buf)
         _, call_args, arg_types = self.args.cpp_argdefs()
         wrapper.generate_kernel_call(
             kernel_name,

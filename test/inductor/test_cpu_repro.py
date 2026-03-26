@@ -349,6 +349,133 @@ class CPUReproTests(TestCase):
         torch.testing.assert_close(x_comp.grad, grad_x_eager)
         torch.testing.assert_close(w_comp.grad, grad_w_eager)
 
+    @config.patch({"reorder_for_peak_memory": True})
+    def test_convnext_like_backward_live_outputs(self):
+        class LayerNorm2d(nn.LayerNorm):
+            def forward(self, x):
+                x = x.permute(0, 2, 3, 1)
+                x = F.layer_norm(
+                    x, self.normalized_shape, self.weight, self.bias, self.eps
+                )
+                x = x.permute(0, 3, 1, 2)
+                return x
+
+        class Permute(nn.Module):
+            def __init__(self, dims):
+                super().__init__()
+                self.dims = dims
+
+            def forward(self, x):
+                return x.permute(*self.dims)
+
+        def stochastic_depth(x, p, training):
+            if not training or p == 0.0:
+                return x
+            keep_prob = 1.0 - p
+            noise = x.new_empty((x.shape[0], 1, 1, 1)).bernoulli_(keep_prob)
+            return x * noise / keep_prob
+
+        class CNBlock(nn.Module):
+            def __init__(self, dim, p):
+                super().__init__()
+                self.block = nn.Sequential(
+                    nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim),
+                    Permute((0, 2, 3, 1)),
+                    nn.LayerNorm(dim, eps=1e-6),
+                    nn.Linear(dim, 4 * dim),
+                    nn.GELU(),
+                    nn.Linear(4 * dim, dim),
+                    Permute((0, 3, 1, 2)),
+                )
+                self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * 1e-6)
+                self.p = p
+
+            def forward(self, x):
+                y = self.layer_scale * self.block(x)
+                return x + stochastic_depth(y, self.p, self.training)
+
+        class ConvNeXtTinyLike(nn.Module):
+            def __init__(self):
+                super().__init__()
+                dims = [96, 192, 384, 768]
+                depths = [3, 3, 9, 3]
+                drop_probs = torch.linspace(0, 0.1, sum(depths)).tolist()
+
+                layers = [
+                    nn.Sequential(
+                        nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
+                        LayerNorm2d(dims[0]),
+                    )
+                ]
+                idx = 0
+                for i, depth in enumerate(depths):
+                    layers.append(
+                        nn.Sequential(
+                            *[
+                                CNBlock(dims[i], drop_probs[idx + j])
+                                for j in range(depth)
+                            ]
+                        )
+                    )
+                    idx += depth
+                    if i + 1 < len(depths):
+                        layers.append(
+                            nn.Sequential(
+                                LayerNorm2d(dims[i]),
+                                nn.Conv2d(
+                                    dims[i], dims[i + 1], kernel_size=2, stride=2
+                                ),
+                            )
+                        )
+
+                self.features = nn.Sequential(*layers)
+                self.avgpool = nn.AdaptiveAvgPool2d(1)
+                self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+                self.head = nn.Linear(dims[-1], 1000)
+
+            def forward(self, x):
+                x = self.features(x)
+                x = self.avgpool(x)
+                x = torch.flatten(x, 1)
+                x = self.norm(x)
+                return self.head(x)
+
+        class ReproModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = ConvNeXtTinyLike()
+
+            def forward(self, x1, x2):
+                e1 = self.backbone(x1)
+                e2 = self.backbone(x2)
+                return e1.float().pow(2).mean() + e2.float().pow(2).mean()
+
+        def run(model, x1, x2):
+            x1 = x1.clone().requires_grad_(True)
+            x2 = x2.clone().requires_grad_(True)
+            loss = model(x1, x2)
+            loss.backward()
+            return loss.detach(), x1.grad.detach(), x2.grad.detach()
+
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        eager_model = ReproModel()
+        x1 = torch.randn(4, 3, 64, 64)
+        x2 = torch.randn(4, 3, 64, 64)
+
+        torch.manual_seed(123)
+        expected_loss, expected_x1_grad, expected_x2_grad = run(
+            copy.deepcopy(eager_model), x1, x2
+        )
+
+        torch.manual_seed(123)
+        compiled_model = torch.compile(copy.deepcopy(eager_model), backend="inductor")
+        actual_loss, actual_x1_grad, actual_x2_grad = run(compiled_model, x1, x2)
+
+        torch.testing.assert_close(actual_loss, expected_loss)
+        torch.testing.assert_close(actual_x1_grad, expected_x1_grad)
+        torch.testing.assert_close(actual_x2_grad, expected_x2_grad)
+
     @config.patch(freezing=True)
     @unittest.skipIf(not TEST_MKL, "Test requires MKL")
     @patch("torch.cuda.is_available", lambda: False)
